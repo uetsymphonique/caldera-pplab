@@ -143,6 +143,58 @@ class ContactService(ContactServiceInterface, BaseService):
                         all_facts = await operation.all_facts()
                         loop.create_task(self.get_service('learning_svc').learn(all_facts, link, result.output,
                                                                                 operation))
+                else:
+                    if result.output:
+                        result.output = await self._postprocess_link_result(result.output, link)
+                    command_results = json.dumps(dict(
+                        stdout=self.decode_bytes(result.output, strip_newlines=False),
+                        stderr=self.decode_bytes(result.stderr, strip_newlines=False),
+                        exit_code=result.exit_code))
+                    operation = await self.get_service('app_svc').find_op_with_link(result.id)
+                if operation and not link.cleanup:
+                    fwd_messages = {
+                        'timestamp': datetime.now(timezone.utc).isoformat(),
+                        'message_type': 'link_result',
+                        'operation': {
+                            'name': operation.name,
+                            'operation_id': operation.id,
+                            'operation_start': operation.start.isoformat() if operation.start else None,
+                        },
+                        
+                        'execution': {
+                            'link_id': link.id,
+                            'agent_host': link.host,
+                            'agent_paw': link.paw,
+                            'command': self.decode_bytes(link.plaintext_command),
+                            'pid': link.pid,
+                            'status': link.status,
+                            'result_data': command_results,
+                            'agent_reported_time': link.agent_reported_time.replace(tzinfo=timezone.utc).isoformat() if link.agent_reported_time else None,
+                        }
+                    }
+                    for state in link.states:
+                        if link.states[state] == link.status:
+                            fwd_messages['execution']['link_state'] = state
+                            break
+                    self.log.info(f'Forwarding result and detection instructions accompained with link {link.id} from here\n' +
+                                  f'Operation: {operation.name} - {operation.id} (start at {operation.start})\n' +
+                                  f'Agent: {link.host} - {link.paw}\n' +
+                                  f'Link (pid: {link.pid}) - reported by agent at {link.agent_reported_time}:\n' +
+                                  f'[+] command: {self.decode_bytes(link.plaintext_command)}\n' +
+                                  f'[+] result: {command_results}\n' +
+                                  f'[+] reported state: {fwd_messages["execution"]["link_state"]}')
+                    
+                    if link.ability and 'detections' in link.ability.display['additional_info']:
+                        fwd_messages['execution']['detections'] = link.ability.display['additional_info']['detections']
+                    else:
+                        fwd_messages['execution']['detections'] = None
+                    self.log.info(f'[+] detections: {fwd_messages["execution"]["detections"]}')
+                    # TODO: send fwd_messages to the message queue
+                    try:
+                        await self._publish_to_queue(fwd_messages)
+                    except Exception as e:
+                        self.log.error(f'Unexpected error occurred while publishing to queue: {e}')
+
             else:
                 command_results = json.dumps(dict(
                     stdout=self.decode_bytes(result.output, strip_newlines=False),
@@ -152,6 +204,77 @@ class ContactService(ContactServiceInterface, BaseService):
                 self.get_service('file_svc').write_result_file(result.id, encoded_command_results)
         except Exception as e:
             self.log.exception(f'Unexpected error occurred while saving link - {e}')
+
+    async def _publish_to_queue(self, fwd_messages):
+        """Publish execution results to RabbitMQ for Checking Engine processing"""
+        try:
+            import aio_pika
+            
+            # Configuration - should be moved to config file in production
+            rabbitmq_config = {
+                'host': self.get_config(prop='checking_engine.rabbitmq_host') or 'localhost',
+                'port': self.get_config(prop='checking_engine.rabbitmq_port') or 5672,
+                'vhost': self.get_config(prop='checking_engine.rabbitmq_vhost') or '/caldera_checking',
+                'username': self.get_config(prop='checking_engine.rabbitmq_username') or 'caldera_publisher',
+                'password': self.get_config(prop='checking_engine.rabbitmq_password') or '',
+                'exchange': self.get_config(prop='checking_engine.rabbitmq_exchange') or 'caldera.checking.exchange',
+                'routing_key': self.get_config(prop='checking_engine.rabbitmq_routing_key') or 'caldera.execution.result'
+            }
+
+            self.log.info(f'RabbitMQ configuration: {rabbitmq_config}')
+            
+            if not rabbitmq_config['password']:
+                self.log.warning('RabbitMQ password not configured. Message publishing disabled.')
+                return
+            
+            # Connect and publish (aio_pika handles vhost encoding)
+            connection = await aio_pika.connect_robust(
+                host=rabbitmq_config['host'],
+                port=rabbitmq_config['port'],
+                login=rabbitmq_config['username'],
+                password=rabbitmq_config['password'],
+                virtualhost=rabbitmq_config['vhost'],
+                timeout=5.0,
+                heartbeat=600,
+                blocked_connection_timeout=300
+            )
+            
+            async with connection:
+                channel = await connection.channel()
+                
+                # Get the exchange (it should exist from setup)
+                exchange = await channel.get_exchange(rabbitmq_config['exchange'])
+                
+                # Create message with persistence
+                message_body = json.dumps(fwd_messages, ensure_ascii=False).encode('utf-8')
+                message = aio_pika.Message(
+                    message_body,
+                    delivery_mode=aio_pika.DeliveryMode.PERSISTENT,  # Survive broker restart
+                    content_type='application/json',
+                    content_encoding='utf-8',
+                    timestamp=datetime.now(timezone.utc)
+                )
+                
+                # Publish message
+                await exchange.publish(
+                    message,
+                    routing_key=rabbitmq_config['routing_key']
+                )
+                
+                self.log.info(f'Successfully published message to RabbitMQ: '
+                             f'exchange={rabbitmq_config["exchange"]}, '
+                             f'routing_key={rabbitmq_config["routing_key"]}, '
+                             f'link_id={fwd_messages.get("execution", {}).get("link_id", "unknown")}')
+                
+        except ImportError:
+            self.log.error('aio-pika library not installed. Install with: pip install aio-pika')
+        except aio_pika.exceptions.AMQPConnectionError as e:
+            self.log.error(f'Failed to connect to RabbitMQ: {e}')
+        except aio_pika.exceptions.AMQPChannelError as e:
+            self.log.error(f'RabbitMQ channel error: {e}')
+        except Exception as e:
+            self.log.error(f'Unexpected error publishing to RabbitMQ: {e}')
+            # Don't re-raise - we don't want to break Caldera if RabbitMQ is down
 
     async def _postprocess_link_result(self, result, link):
         if link.ability.HOOKS and link.executor.name in link.ability.HOOKS:

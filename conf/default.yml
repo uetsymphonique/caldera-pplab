@@ -60,3 +60,11 @@ users:
   red:
     admin: admin
     red: admin
+
+checking_engine.rabbitmq_exchange: caldera.checking.exchange
+checking_engine.rabbitmq_host: localhost
+checking_engine.rabbitmq_password: hihi
+checking_engine.rabbitmq_port: 5672
+checking_engine.rabbitmq_routing_key: caldera.execution.result
+checking_engine.rabbitmq_username: caldera_publisher
+checking_engine.rabbitmq_vhost: /caldera_checking
