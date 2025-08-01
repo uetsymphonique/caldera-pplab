@@ -49,3 +49,7 @@
 [submodule "plugins/magma"]
 	path = plugins/magma
 	url = https://github.com/mitre/magma.git
+[submodule "expand/checking-engine"]
+	path = expand/checking-engine
+	url = https://github.com/uetsymphonique/checking-engine-pplab.git
+	branch = main
